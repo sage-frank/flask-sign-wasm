@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>签名登录与查询</title>
+</head>
+<body>
+  <div>
+    <label>用户名：<input id="username" /></label>
+    <label>密码：<input id="password" type="password" /></label>
+    <button id="btnLogin">登录</button>
+  </div>
+  <hr />
+  <div>
+    <button id="btnQuery">查询</button>
+    <table border="1" id="resultTable">
+      <thead><tr><th>ID</th><th>Name</th><th>Status</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <script src="/static/wasm.js"></script>
+  <script src="/static/main.js"></script>
+</body>
+<style>
+body { font-family: sans-serif; margin: 20px; }
+label { margin-right: 10px; }
+table { margin-top: 10px; width: 100%; }
+</style>
+</html>

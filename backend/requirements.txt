@@ -1,0 +1,4 @@
+Flask>=3.0
+redis>=5.0
+wasmtime>=20.0
+flask-cors
