@@ -1,208 +1,161 @@
-from flask import Flask, request, jsonify, make_response, send_from_directory
+import os, json, time, base64, secrets, wasmtime
+from flask import Flask, request, jsonify, g, make_response
 from flask_cors import CORS
-import os
-import json
-import secrets
-import base64
-import time
+from functools import wraps
 from uuid import uuid4
+from services.redis_client import get_redis
 
-FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
+app = Flask(__name__)
+CORS(app, supports_credentials=True, origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002"])
 
-try:
-    from services.redis_client import get_redis
-    from services.py_crypto import derive_key_b64, hmac_b64_with_b64key, sha256_b64
-except ImportError:
-    from .services.redis_client import get_redis
-    from .services.py_crypto import derive_key_b64, hmac_b64_with_b64key, sha256_b64
+# Ensure we find the WASM file relative to this script
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WASM_FILE = os.path.join(BASE_DIR, "wasm", "sign_wasm.wasm")
+app.config.update({"WASM_PATH": WASM_FILE, "TIME_SKEW": 60})
 
-app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="/static")
-# 允许前端 3000 端口与 file://（Origin 为 null）跨域，支持凭证（Cookie）
-CORS(
-    app,
-    supports_credentials=True,
-    origins=["http://127.0.0.1:5000", "http://localhost:5000", "null"],
-)
+# --- WASM 运行时驱动 ---
+class WasmSigner:
+    def __init__(self, path):
+        self.path = path
+        self._init()
 
-app.config["APP_SALT"] = os.getenv("APP_SALT", "app-default-salt")
-def _resolve_wasm_path():
-    env_path = os.getenv("WASM_PATH")
-    if env_path and os.path.exists(env_path):
-        return env_path
-    base = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    candidates = [
-        os.path.join(base, "wasm", "sign_wasm.wasm"),
-        os.path.join(os.path.dirname(__file__), "wasm", "sign_wasm.wasm"),
-        os.path.join(base, "frontend", "wasm", "sign_wasm.wasm"),
-        os.path.join(base, "sign-wasm", "target", "wasm32-unknown-unknown", "release", "sign_wasm.wasm"),
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return candidates[0]
-app.config["WASM_PATH"] = _resolve_wasm_path()
-print("WASM_PATH", app.config["WASM_PATH"], flush=True)
-app.config["SESSION_TTL_SECONDS"] = int(os.getenv("SESSION_TTL", "3600"))
-app.config["SALT_TTL_SECONDS"] = int(os.getenv("SALT_TTL", "60"))
+    def _init(self):
+        engine = wasmtime.Engine()
+        self.store = wasmtime.Store(engine)
+        module = wasmtime.Module.from_file(engine, self.path)
+        instance = wasmtime.Instance(self.store, module, [])
+        self.exports = instance.exports(self.store)
 
-USERS = {}
-DEFAULT_USER = os.getenv("DEMO_USER", "admin")
-DEFAULT_PASS = os.getenv("DEMO_PASS", "password")
+    def call(self, func_name, data):
+        if func_name not in self.exports:
+            self._init()
+        if func_name not in self.exports:
+            raise KeyError(func_name)
+        bs = json.dumps(data).encode()
+        ptr = self.exports["alloc"](self.store, len(bs))
+        self.exports["memory"].write(self.store, bs, ptr)
+        
+        out_ptr = self.exports[func_name](self.store, ptr, len(bs))
+        out_len = self.exports["result_len"](self.store)
+        out = self.exports["memory"].read(self.store, out_ptr, out_ptr + out_len)
+        
+        self.exports["dealloc"](self.store, ptr, len(bs))
+        self.exports["dealloc"](self.store, out_ptr, out_len)
+        return json.loads(out.decode())
 
+signer = WasmSigner(app.config["WASM_PATH"])
 
-def _ensure_demo_user():
-    if DEFAULT_USER not in USERS:
-        app_salt = app.config["APP_SALT"]
-        key_b64 = derive_key_b64(DEFAULT_PASS, app_salt, 100000)
-        USERS[DEFAULT_USER] = key_b64
+# --- 辅助工具 ---
+def get_user_key(username):
+    # 模拟数据库：生产环境应从 DB 读取用户的 PBKDF2 派生密钥
+    return base64.b64encode(b"dummy-key-for-" + username.encode()).decode()
 
+# --- 核心拦截器 ---
+def verify_api_sign(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        r, data = get_redis(), request.get_json(force=True)
+        print("func verify_api_sign, data:", data, flush=True)
+        # 1. 消费 Salt (一次性)
+        salt_val = r.get(f"salt:{data.get('salt_id')}")
+        if not salt_val: return jsonify({"ok": False, "error": "salt_invalid"}), 400
+        r.delete(f"salt:{data.get('salt_id')}")
+        print("func verify_api_sign, salt_val:", salt_val.decode(), flush=True)
 
-_ensure_demo_user()
+        
+        print("func verify_api_sign, path:", request.path, flush=True)
+        print("func verify_api_sign, method:", request.method, flush=True)
+        
+        # 2. 准备校验负载
+        username = getattr(g, 'user', data.get('username'))
+        payload = {
+            "method": request.method, "path": request.path,
+            "params": data.get("params", {}), "nonce": data.get("nonce"),
+            "salt": salt_val.decode(), "timestamp": int(data.get("timestamp", 0)),
+            "sig": data.get("sig"), "server_ts": int(time.time()),
+            "max_skew_seconds": app.config["TIME_SKEW"]
+        }
+        print("func verify_api_sign, payload:", payload, flush=True)
+        
+        # 针对登录或常规请求注入密钥
+        if request.path == "/api/login" and "password" in data:
+            payload.update({"password": data["password"], "app_salt": "static-salt"})
+        else:
+            payload["key_base64"] = get_user_key(username)
+            print("func verify_api_sign, key_base64:", payload["key_base64"], flush=True)
 
+        # 3. 调用 WASM 验证
+        try:
+            res = signer.call("verify_request", payload)
+            print("func verify_api_sign, res:", res, flush=True)
+        except KeyError:
+            ts = int(time.time())
+            diff = abs(ts - int(payload.get("timestamp", 0)))
+            if diff > app.config["TIME_SKEW"]:
+                return jsonify({"ok": False, "error": "timestamp_expired"}), 401
+            sign_payload = dict(payload)
+            sign_payload.pop("sig", None)
+            try:
+                out = signer.call("sign_request", sign_payload)
+            except KeyError:
+                return jsonify({"ok": False, "error": "wasm_missing_func"}), 500
+            exp = out.get("sig")
+            if not exp or exp != data.get("sig"):
+                return jsonify({"ok": False, "error": "sig_mismatch"}), 401
+            res = {"ok": True}
+        if not res.get("ok"):
+            return jsonify({"ok": False, "error": res.get("error")}), 401
+        return f(*args, **kwargs)
+    return wrapper
 
-def _make_salt():
-    salt_bytes = secrets.token_bytes(24)
-    return base64.b64encode(salt_bytes).decode()
-
-
-def _store_salt(r, salt_id, salt_b64, ttl):
-    r.setex(f"salt:{salt_id}", ttl, salt_b64)
-
-
-def _consume_salt(r, salt_id):
-    key = f"salt:{salt_id}"
-    val = r.get(key)
-    if val is not None:
-        r.delete(key)
-    return val.decode() if val else None
-
-
-def _set_session(r, username):
-    sid = uuid4().hex
-    r.setex(
-        f"sess:{sid}", app.config["SESSION_TTL_SECONDS"], json.dumps({"u": username})
-    )
-    resp = make_response(jsonify({"ok": True}))
-    resp.set_cookie(
-        "session_id",
-        sid,
-        max_age=app.config["SESSION_TTL_SECONDS"],
-        httponly=True,
-        secure=False,
-        samesite="Lax",
-    )
-    return resp
-
-
-def _require_session(r):
-    sid = request.cookies.get("session_id")
-    if not sid:
-        return None
-    data = r.get(f"sess:{sid}")
-    return (sid, json.loads(data.decode())) if data else (None, None)
-
-
+# --- 路由接口 ---
 @app.route("/api/salt", methods=["GET"])
 def api_salt():
-    r = get_redis()
-    salt_id = uuid4().hex
-    salt_b64 = _make_salt()
-    _store_salt(r, salt_id, salt_b64, app.config["SALT_TTL_SECONDS"])
-    return jsonify(
-        {
-            "salt_id": salt_id,
-            "salt": salt_b64,
-            "expires_in": app.config["SALT_TTL_SECONDS"],
-        }
-    )
-
+    salt_id, salt_b64 = uuid4().hex, base64.b64encode(secrets.token_bytes(24)).decode()
+    get_redis().setex(f"salt:{salt_id}", 60, salt_b64)
+    return jsonify({"salt_id": salt_id, "salt": salt_b64})
 
 @app.route("/api/login", methods=["POST"])
+@verify_api_sign
 def api_login():
-    r = get_redis()
-    data = request.get_json(force=True)
-    username = data.get("username", "")
-    sig = data.get("sig", "")
-    salt_id = data.get("salt_id", "")
-    ts = int(data.get("timestamp", 0))
-    nonce = data.get("nonce", "")
-    body = data.get("body", "")
-    salt_b64 = _consume_salt(r, salt_id)
-    if not salt_b64:
-        return jsonify({"ok": False, "error": "salt_invalid"}), 400
-    key_b64 = USERS.get(username)
-    if not key_b64:
-        return jsonify({"ok": False, "error": "user_not_found"}), 404
-    body_hash = sha256_b64(body)
-    message = f"POST|/api/login|{salt_b64}|{ts}|{nonce}|{body_hash}"
-    expect_sig = hmac_b64_with_b64key(key_b64, message)
-    if expect_sig != sig:
-        return jsonify({"ok": False, "error": "sig_mismatch"}), 401
-    return _set_session(r, username)
-
-
-@app.route("/api/query", methods=["POST"])
-def api_query():
-    r = get_redis()
-    sid, sess = _require_session(r)
-    if not sid:
-        return jsonify({"ok": False, "error": "not_logged_in"}), 401
-    data = request.get_json(force=True)
-    username = data.get("username", "")
-    sig = data.get("sig", "")
-    salt_id = data.get("salt_id", "")
-    ts = int(data.get("timestamp", 0))
-    nonce = data.get("nonce", "")
-    body = data.get("body", "")
-    salt_b64 = _consume_salt(r, salt_id)
-    
-    
-    if not salt_b64:
-        return jsonify({"ok": False, "error": "salt_invalid"}), 400
-    key_b64 = USERS.get(username)
-    if not key_b64:
-        return jsonify({"ok": False, "error": "user_not_found"}), 404
-    body_hash = sha256_b64(body)
-    message = f"POST|/api/query|{salt_b64}|{ts}|{nonce}|{body_hash}"
-    expect_sig = hmac_b64_with_b64key(key_b64, message)
-    if expect_sig != sig:
-        return jsonify({"ok": False, "error": "sig_mismatch"}), 401
-    rows = [
-        {"id": 1, "name": "Alice", "status": "active"},
-        {"id": 2, "name": "Bob", "status": "inactive"},
-        {"id": 3, "name": "Carol", "status": "active"},
-    ]
-    return jsonify({"ok": True, "rows": rows})
-
-
-@app.route("/api/wasm-version", methods=["GET"])
-def api_wasm_version():
-    return jsonify({"version": "py"})
-
-
-@app.route("/wasm/sign_wasm.wasm", methods=["GET"])
-def wasm_file():
-    path = app.config["WASM_PATH"]
-    if not os.path.exists(path):
-        return jsonify({"error": "wasm_missing"}), 404
-    with open(path, "rb") as f:
-        data = f.read()
-    resp = make_response(data)
-    resp.headers["Content-Type"] = "application/wasm"
+    username = request.json.get("username")
+    print("func api_login, username:", username, flush=True)
+    sid = uuid4().hex
+    get_redis().setex(f"sess:{sid}", 3600, json.dumps({"u": username}))
+    resp = make_response(jsonify({
+        "status": "ok",
+        "user": username,
+        "key_b64": get_user_key(username)
+    }))
+    resp.set_cookie("session_id", sid, httponly=True)
     return resp
 
+@app.route("/api/query", methods=["POST"])
+@verify_api_sign
+def api_query():
+    # 此时签名已在装饰器中完成 Wasm 校验
+    return jsonify({"ok": True, "data": "Top Secret Content"})
 
+@app.route("/api/session", methods=["GET"])
+def api_session():
+    sid = request.cookies.get("session_id")
+    if not sid:
+        return jsonify({"status": "fail", "user": None, "key_b64": None})
+    raw = get_redis().get(f"sess:{sid}")
+    if not raw:
+        return jsonify({"status": "fail", "user": None, "key_b64": None})
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        obj = {"u": None}
+    username = obj.get("u")
+    if not username:
+        return jsonify({"status": "fail", "user": None, "key_b64": None})
+    return jsonify({
+        "status": "ok",
+        "user": username,
+        "key_b64": get_user_key(username)
+    })
 
-print("FRONTEND_DIR", FRONTEND_DIR, flush=True)
-@app.route("/", methods=["GET"])
-def index_html():
-    return app.send_static_file("index.html")
-
-
-@app.route("/static/<path:fname>", methods=["GET"])
-def static_files(fname):
-    return send_from_directory(FRONTEND_DIR, fname)
-
-
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
